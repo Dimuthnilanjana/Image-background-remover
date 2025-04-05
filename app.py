@@ -51,7 +51,7 @@ def remove_background():
             'background_threshold': int(request.form.get('background_threshold', 10)),
             'erode_size': int(request.form.get('erode_size', 10)),
             'detail_level': request.form.get('detail_level', 'high'),
-            'subject_type': request.form.get('subject_type', 'general')  # New: human/general
+            'subject_type': request.form.get('subject_type', 'general')
         }
         
         # Read image
@@ -89,95 +89,119 @@ def remove_background_enhanced(img_data, alpha_matting=True,
     Parameters:
     - subject_type: 'human' or 'general' to select appropriate model
     """
-    # Select appropriate session based on subject type
-    session = {
-        'human': human_session,
-        'general': general_session
-    }.get(subject_type, detail_session)
+    try:
+        # Select appropriate session
+        session = {
+            'human': human_session,
+            'general': general_session
+        }.get(subject_type, detail_session)
+        
+        # Initial background removal
+        output = remove(
+            img_data,
+            session=session,
+            alpha_matting=alpha_matting,
+            alpha_matting_foreground_threshold=foreground_threshold,
+            alpha_matting_background_threshold=background_threshold,
+            alpha_matting_erode_size=erode_size
+        )
+        
+        # Convert to numpy array
+        img = Image.open(io.BytesIO(output)).convert('RGBA')
+        img_array = np.array(img)
+        
+        if img_array.shape[2] != 4:
+            logger.warning("Image has no alpha channel")
+            return img
+        
+        if img_array.ndim != 3:
+            logger.error(f"Unexpected image dimensions: {img_array.shape}")
+            return img
+        
+        # Extract and refine alpha channel
+        alpha = img_array[:,:,3]
+        alpha_refined = refine_alpha_channel(
+            alpha,
+            detail_level=detail_level,
+            subject_type=subject_type
+        )
+        
+        # Apply refined alpha
+        img_array[:,:,3] = alpha_refined
+        
+        # Additional cleanup for human subjects
+        if subject_type == 'human':
+            img_array = cleanup_human_edges(img_array)
+        
+        return Image.fromarray(img_array)
     
-    # Initial background removal
-    output = remove(
-        img_data,
-        session=session,
-        alpha_matting=alpha_matting,
-        alpha_matting_foreground_threshold=foreground_threshold,
-        alpha_matting_background_threshold=background_threshold,
-        alpha_matting_erode_size=erode_size
-    )
-    
-    # Convert to numpy array
-    img = Image.open(io.BytesIO(output)).convert('RGBA')
-    img_array = np.array(img)
-    
-    if img_array.shape[2] != 4:
-        return img  # Return if no alpha channel
-    
-    # Extract and refine alpha channel
-    alpha = img_array[:,:,3]
-    
-    # Advanced edge refinement
-    alpha_refined = refine_alpha_channel(
-        alpha,
-        detail_level=detail_level,
-        subject_type=subject_type
-    )
-    
-    # Apply refined alpha
-    img_array[:,:,3] = alpha_refined
-    
-    # Additional cleanup
-    if subject_type == 'human':
-        img_array = cleanup_human_edges(img_array)
-    
-    return Image.fromarray(img_array)
+    except Exception as e:
+        logger.error(f"Error in remove_background_enhanced: {str(e)}")
+        return Image.open(io.BytesIO(img_data))  # Return original on failure
 
 def refine_alpha_channel(alpha, detail_level='high', subject_type='general'):
     """Advanced alpha channel refinement"""
-    # Initial edge detection
-    edges = cv2.Canny(alpha, 100, 200)
-    
-    if detail_level == 'low':
-        return cv2.GaussianBlur(alpha, (5, 5), 0)
-    
-    elif detail_level == 'medium':
-        # Adaptive thresholding for better edge preservation
-        alpha_adaptive = cv2.adaptiveThreshold(
-            alpha, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-        return cv2.medianBlur(alpha_adaptive, 3)
-    
-    else:  # high detail
-        # Multi-stage refinement
-        # 1. Bilateral filter for edge-preserving smoothing
-        alpha_smooth = cv2.bilateralFilter(alpha, 9, 75, 75)
+    try:
+        # Initial edge detection
+        edges = cv2.Canny(alpha, 100, 200)
         
-        # 2. Edge enhancement with morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-        alpha_eroded = cv2.erode(alpha_smooth, kernel, iterations=1)
-        alpha_dilated = cv2.dilate(alpha_eroded, kernel, iterations=1)
+        if detail_level == 'low':
+            return cv2.GaussianBlur(alpha, (5, 5), 0)
         
-        # 3. Blend with original edges
-        alpha_final = cv2.addWeighted(alpha_dilated, 0.7, edges, 0.3, 0)
-        return np.clip(alpha_final, 0, 255)
+        elif detail_level == 'medium':
+            # Adaptive thresholding for better edge preservation
+            alpha_adaptive = cv2.adaptiveThreshold(
+                alpha, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            return cv2.medianBlur(alpha_adaptive, 3)
+        
+        else:  # high detail
+            # Multi-stage refinement
+            alpha_smooth = cv2.bilateralFilter(alpha, 9, 75, 75)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+            alpha_eroded = cv2.erode(alpha_smooth, kernel, iterations=1)
+            alpha_dilated = cv2.dilate(alpha_eroded, kernel, iterations=1)
+            alpha_final = cv2.addWeighted(alpha_dilated, 0.7, edges, 0.3, 0)
+            return np.clip(alpha_final, 0, 255)
+    
+    except Exception as e:
+        logger.error(f"Error in refine_alpha_channel: {str(e)}")
+        return alpha
 
 def cleanup_human_edges(img_array):
     """Special cleanup for human subjects"""
-    # Convert to HSV for skin detection
-    hsv = cv2.cvtColor(img_array[:,:,:3], cv2.COLOR_RGB2HSV)
+    try:
+        # Convert to HSV for skin detection
+        hsv = cv2.cvtColor(img_array[:,:,:3], cv2.COLOR_RGB2HSV)
+        
+        # Define skin color range
+        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+        
+        # Create mask for skin areas (2D)
+        skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        
+        # Get alpha channel (2D)
+        alpha = img_array[:,:,3]
+        alpha_refined = alpha.copy()
+        
+        # Apply dilation only to skin areas
+        skin_alpha = alpha.copy()
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        dilated_skin = cv2.dilate(skin_alpha, kernel, iterations=1)
+        
+        # Apply the dilated result only where skin_mask is True
+        alpha_refined[skin_mask > 0] = dilated_skin[skin_mask > 0]
+        
+        # Update the original array
+        img_array[:,:,3] = alpha_refined
+        
+        return img_array
     
-    # Define skin color range
-    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-    upper_skin = np.array([20, 255, 255], dtype=np.uint8)
-    
-    # Create mask for skin areas
-    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
-    
-    # Refine alpha channel near skin areas
-    alpha = img_array[:,:,3]
-    alpha[skin_mask > 0] = cv2.dilate(alpha[skin_mask > 0], None, iterations=1)
-    
-    return img_array
+    except Exception as e:
+        logger.error(f"Error in cleanup_human_edges: {str(e)}")
+        return img_array
 
 @app.route('/download/<filename>')
 def download(filename):
