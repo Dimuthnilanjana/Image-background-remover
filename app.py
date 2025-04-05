@@ -9,8 +9,8 @@ import uuid
 import time
 import logging
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup detailed logging
+logging.basicConfig(level=logging.DEBUG)  # Changed to DEBUG for more info
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -20,9 +20,9 @@ PROCESSED_FOLDER = 'static/processed'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
-# Initialize sessions - only use the most reliable models
-human_session = new_session("u2net_human_seg")
-general_session = new_session("u2net")  # Most reliable general model
+# Initialize sessions
+human_session = new_session("u2net_human_seg")  # Optimized for humans
+general_session = new_session("isnet-general-use")  # For general objects
 
 @app.route('/')
 def index():
@@ -49,18 +49,23 @@ def remove_background():
             'foreground_threshold': int(request.form.get('foreground_threshold', 240)),
             'background_threshold': int(request.form.get('background_threshold', 10)),
             'erode_size': int(request.form.get('erode_size', 10)),
-            'subject_type': request.form.get('subject_type', 'general')
+            'subject_type': request.form.get('subject_type', 'general'),
+            'fine_tune': 'fine_tune' in request.form,
+            'quality': request.form.get('quality', 'high')
         }
         
         with open(temp_path, 'rb') as img_file:
             img_data = img_file.read()
         
-        # Process image with simplified approach
-        result = process_image(img_data, params)
+        start_time = time.time()
+        result = remove_background_enhanced(img_data, **params)
         
         output_filename = f"processed_{uuid.uuid4()}.png"
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
-        result.save(output_path, format='PNG')
+        logger.debug(f"Saving processed image to {output_path}")
+        result.save(output_path, format='PNG', optimize=True)
+        
+        logger.info(f"Processing time: {time.time() - start_time:.2f} seconds")
         
         return render_template('index.html',
                           result_image=f"processed/{output_filename}",
@@ -70,43 +75,104 @@ def remove_background():
         logger.error(f"Error: {str(e)}")
         return render_template('index.html', error=f'Processing failed: {str(e)}')
 
-def process_image(img_data, params):
-    """Simple, reliable image processing"""
+def remove_background_enhanced(img_data, alpha_matting=True, 
+                             foreground_threshold=240,
+                             background_threshold=10,
+                             erode_size=10,
+                             subject_type='general'):
+    """
+    Robust background removal with full cleanup
+    """
     try:
-        # Choose the right model
-        session = human_session if params['subject_type'] == 'human' else general_session
+        logger.debug(f"Starting background removal for {subject_type}")
+        
+        # Select session
+        session = human_session if subject_type == 'human' else general_session
         
         # Use rembg with minimal post-processing
         output = remove(
             img_data,
             session=session,
-            alpha_matting=params['alpha_matting'],
-            alpha_matting_foreground_threshold=params['foreground_threshold'],
-            alpha_matting_background_threshold=params['background_threshold'],
-            alpha_matting_erode_size=params['erode_size']
+            alpha_matting=alpha_matting,
+            alpha_matting_foreground_threshold=foreground_threshold,
+            alpha_matting_background_threshold=background_threshold,
+            alpha_matting_erode_size=erode_size,
+            post_process_mask=True
         )
         
-        # Load as PIL image and ensure RGBA
-        result_img = Image.open(io.BytesIO(output)).convert('RGBA')
+        # Load original for color preservation
+        logger.debug("Loading original image")
+        original_img = Image.open(io.BytesIO(img_data)).convert('RGB')
+        original_array = np.array(original_img, dtype=np.uint8)
         
-        # Basic post-processing for cleaner edges
-        img_array = np.array(result_img)
+        # Process rembg result
+        logger.debug("Processing rembg output")
+        img = Image.open(io.BytesIO(output)).convert('RGBA')
+        img_array = np.array(img, dtype=np.uint8)
         
-        # Simple threshold for clean background/foreground separation
+        if img_array.shape[2] != 4:
+            logger.warning("Image has no alpha channel")
+            return img
+        
+        # Extract alpha
         alpha = img_array[:,:,3]
-        alpha = np.where(alpha > 20, 255, 0).astype(np.uint8)
-        img_array[:,:,3] = alpha
+        logger.debug(f"Alpha channel stats - min: {alpha.min()}, max: {alpha.max()}, mean: {alpha.mean():.2f}")
         
-        # Make fully transparent pixels completely black (0,0,0,0)
-        mask = alpha == 0
-        img_array[mask, 0:3] = 0
+        # Aggressive cleanup: trust rembg but ensure full removal
+        alpha_refined = np.where(alpha > 20, 255, 0).astype(np.uint8)  # Very low threshold
+        
+        # Human-specific enhancement
+        if subject_type == 'human':
+            alpha_refined = enhance_human_mask(alpha_refined, original_array)
+        
+        # Apply alpha
+        logger.debug("Applying refined alpha")
+        img_array[:,:,3] = alpha_refined
+        
+        # Final cleanup
+        mask = img_array[:,:,3] > 0
+        logger.debug(f"Foreground pixels: {np.sum(mask)}, Background pixels: {np.sum(~mask)}")
+        img_array[mask, :3] = original_array[mask]  # Original colors
+        img_array[~mask, :3] = 0  # Fully transparent background
         
         return Image.fromarray(img_array)
         
     except Exception as e:
-        logger.error(f"Processing error: {str(e)}")
-        # Return original image on failure
+        logger.error(f"Error in remove_background_enhanced: {str(e)}", exc_info=True)
         return Image.open(io.BytesIO(img_data))
+
+def enhance_human_mask(alpha, original_array):
+    """Enhance mask for human subjects"""
+    try:
+        logger.debug("Enhancing human mask")
+        
+        # Convert to HSV for subject detection
+        hsv = cv2.cvtColor(original_array, cv2.COLOR_RGB2HSV)
+        
+        # Broad subject detection
+        lower_bound = np.array([0, 5, 20], dtype=np.uint8)  # Permissive range
+        upper_bound = np.array([180, 255, 255], dtype=np.uint8)
+        subject_mask = cv2.inRange(hsv, lower_bound, upper_bound)
+        
+        # Expand subject slightly
+        kernel = np.ones((5,5), np.uint8)
+        subject_mask = cv2.dilate(subject_mask, kernel, iterations=2)
+        
+        # Refine alpha
+        alpha_refined = alpha.copy()
+        alpha_refined[subject_mask > 0] = 255  # Full opacity for subject
+        
+        # Clean background
+        background_mask = cv2.bitwise_not(subject_mask)
+        alpha_refined[background_mask > 0] = 0  # Force background to transparent
+        
+        logger.debug(f"Enhanced alpha stats - min: {alpha_refined.min()}, max: {alpha_refined.max()}")
+        
+        return alpha_refined
+    
+    except Exception as e:
+        logger.error(f"Error in enhance_human_mask: {str(e)}", exc_info=True)
+        return alpha
 
 @app.route('/download/<filename>')
 def download(filename):
