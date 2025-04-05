@@ -21,7 +21,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
 # Initialize sessions
-human_session = new_session("u2net_human_seg")  # Specialized for human subjects
+human_session = new_session("u2net_human_seg")  # For human subjects
 general_session = new_session("isnet-general-use")  # For general objects
 detail_session = new_session("u2net")  # For high detail
 
@@ -79,7 +79,7 @@ def remove_background_enhanced(img_data, alpha_matting=True,
                              detail_level='high',
                              subject_type='general'):
     """
-    Enhanced background removal with precise edge handling
+    Highly accurate background removal with multi-pass refinement
     """
     try:
         session = {
@@ -87,7 +87,7 @@ def remove_background_enhanced(img_data, alpha_matting=True,
             'general': general_session
         }.get(subject_type, detail_session)
         
-        # Initial background removal with tighter thresholds for human subjects
+        # Initial background removal
         output = remove(
             img_data,
             session=session,
@@ -95,14 +95,14 @@ def remove_background_enhanced(img_data, alpha_matting=True,
             alpha_matting_foreground_threshold=foreground_threshold,
             alpha_matting_background_threshold=background_threshold,
             alpha_matting_erode_size=erode_size,
-            post_process_mask=True  # Enable rembg's built-in mask post-processing
+            post_process_mask=True
         )
         
-        # Load original image for reference
+        # Load original image
         original_img = Image.open(io.BytesIO(img_data)).convert('RGB')
-        original_array = np.array(original_img)
+        original_array = np.array(original_img, dtype=np.uint8)
         
-        # Process result
+        # Process initial result
         img = Image.open(io.BytesIO(output)).convert('RGBA')
         img_array = np.array(img, dtype=np.uint8)
         
@@ -110,25 +110,30 @@ def remove_background_enhanced(img_data, alpha_matting=True,
             logger.warning("Image has no alpha channel")
             return img
         
-        # Extract alpha and enhance
+        # First pass: Initial alpha refinement
         alpha = img_array[:,:,3]
         alpha_refined = refine_alpha_channel(
             alpha,
             detail_level=detail_level,
             subject_type=subject_type,
-            original_array=original_array  # Pass original for reference
+            original_array=original_array
         )
+        
+        # Second pass: GrabCut for human subjects
+        if subject_type == 'human':
+            alpha_refined = refine_with_grabcut(original_array, alpha_refined)
         
         # Apply refined alpha
         img_array[:,:,3] = alpha_refined
         
-        # Human-specific cleanup with improved edge handling
+        # Human-specific cleanup
         if subject_type == 'human':
             img_array = cleanup_human_edges(img_array, original_array)
         
-        # Final cleanup: ensure no residual background blur
+        # Final cleanup
         mask = img_array[:,:,3] > 0
-        img_array[mask, :3] = original_array[mask]  # Use original colors where alpha exists
+        img_array[mask, :3] = original_array[mask]  # Preserve original colors
+        img_array[~mask, :3] = 0  # Ensure background is fully black
         
         return Image.fromarray(img_array)
     
@@ -137,10 +142,10 @@ def remove_background_enhanced(img_data, alpha_matting=True,
         return Image.open(io.BytesIO(img_data))
 
 def refine_alpha_channel(alpha, detail_level='high', subject_type='general', original_array=None):
-    """Advanced alpha channel refinement with edge preservation"""
+    """First-pass alpha channel refinement"""
     try:
-        # Enhance edges
-        edges = cv2.Canny(alpha, 100, 200)
+        # Edge detection with higher precision
+        edges = cv2.Canny(alpha, 150, 250)
         edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
         
         if detail_level == 'low':
@@ -154,23 +159,19 @@ def refine_alpha_channel(alpha, detail_level='high', subject_type='general', ori
             refined = cv2.medianBlur(alpha_adaptive, 3)
         
         else:  # high detail
-            # Use bilateral filter for edge-preserving smoothing
-            alpha_smooth = cv2.bilateralFilter(alpha, 9, 75, 75)
+            alpha_smooth = cv2.bilateralFilter(alpha, 11, 100, 100)  # Increased parameters for better smoothing
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
             alpha_eroded = cv2.erode(alpha_smooth, kernel, iterations=1)
             alpha_dilated = cv2.dilate(alpha_eroded, kernel, iterations=1)
+            refined = cv2.addWeighted(alpha_dilated, 0.85, edges, 0.15, 0)
             
-            # Blend with edges for sharper boundaries
-            refined = cv2.addWeighted(alpha_dilated, 0.8, edges, 0.2, 0)
-            
-            # Additional refinement for humans
             if subject_type == 'human' and original_array is not None:
                 hsv = cv2.cvtColor(original_array, cv2.COLOR_RGB2HSV)
-                hair_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))  # Dark hair detection
-                refined = np.where(hair_mask > 0, cv2.dilate(refined, kernel, iterations=1), refined)
+                hair_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 75]))
+                refined = np.where(hair_mask > 0, cv2.dilate(refined, kernel, iterations=2), refined)
         
-        # Threshold to remove residual blur
-        refined = np.where(refined > 100, 255, 0).astype(np.uint8)  # Tighter threshold
+        # Strict threshold to eliminate blur
+        refined = np.where(refined > 80, 255, 0).astype(np.uint8)
         
         return refined
     
@@ -178,41 +179,88 @@ def refine_alpha_channel(alpha, detail_level='high', subject_type='general', ori
         logger.error(f"Error in refine_alpha_channel: {str(e)}")
         return alpha
 
-def cleanup_human_edges(img_array, original_array):
-    """Precise cleanup for human subjects"""
+def refine_with_grabcut(original_array, alpha):
+    """Second-pass refinement using GrabCut for human subjects"""
     try:
-        # Convert to HSV for skin and hair detection
+        # Convert alpha to binary mask
+        mask = np.zeros(alpha.shape, dtype=np.uint8)
+        mask[alpha > 128] = 1  # Probable foreground
+        mask[alpha < 50] = 0   # Probable background
+        
+        # Initialize GrabCut
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        
+        # Create a slightly dilated mask for GrabCut initialization
+        kernel = np.ones((5,5), np.uint8)
+        sure_fg = cv2.erode(mask, kernel, iterations=2)
+        sure_bg = cv2.dilate(mask, kernel, iterations=2)
+        
+        mask[sure_fg == 1] = cv2.GC_FGD
+        mask[sure_bg == 0] = cv2.GC_BGD
+        mask[(mask != cv2.GC_FGD) & (mask != cv2.GC_BGD)] = cv2.GC_PR_FGD
+        
+        # Run GrabCut
+        mask, _, _ = cv2.grabCut(
+            original_array,
+            mask,
+            None,
+            bgd_model,
+            fgd_model,
+            5,  # Number of iterations
+            cv2.GC_INIT_WITH_MASK
+        )
+        
+        # Convert GrabCut output to alpha
+        refined_alpha = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        
+        # Smooth edges
+        refined_alpha = cv2.medianBlur(refined_alpha, 3)
+        
+        return refined_alpha
+    
+    except Exception as e:
+        logger.error(f"Error in refine_with_grabcut: {str(e)}")
+        return alpha
+
+def cleanup_human_edges(img_array, original_array):
+    """Final cleanup for human subjects"""
+    try:
         hsv = cv2.cvtColor(original_array, cv2.COLOR_RGB2HSV)
         
-        # Skin detection
-        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        # Enhanced skin detection
+        lower_skin = np.array([0, 15, 60], dtype=np.uint8)
         upper_skin = np.array([20, 255, 255], dtype=np.uint8)
         skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        skin_mask = cv2.dilate(skin_mask, np.ones((3,3), np.uint8), iterations=1)
         
-        # Hair detection (expanded range for various hair colors)
+        # Enhanced hair detection
         lower_hair = np.array([0, 0, 0], dtype=np.uint8)
-        upper_hair = np.array([180, 255, 100], dtype=np.uint8)
+        upper_hair = np.array([180, 255, 120], dtype=np.uint8)
         hair_mask = cv2.inRange(hsv, lower_hair, upper_hair)
-        hair_mask = cv2.dilate(hair_mask, np.ones((3,3), np.uint8), iterations=2)
+        hair_mask = cv2.dilate(hair_mask, np.ones((5,5), np.uint8), iterations=2)
         
         # Combine masks
         subject_mask = cv2.bitwise_or(skin_mask, hair_mask)
         
-        # Get alpha channel
+        # Refine alpha
         alpha = img_array[:,:,3]
         alpha_refined = alpha.copy()
         
-        # Refine edges around subject
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
         alpha_dilated = cv2.dilate(alpha, kernel, iterations=1)
-        alpha_refined[subject_mask > 0] = 255  # Ensure full opacity for subject
-        alpha_refined = cv2.bitwise_and(alpha_dilated, alpha_refined)
         
-        # Remove residual background
+        # Ensure subject is fully opaque
+        alpha_refined[subject_mask > 0] = 255
+        
+        # Clean background
         background_mask = cv2.bitwise_not(subject_mask)
-        alpha_refined[background_mask > 0] = np.minimum(alpha_refined[background_mask > 0], alpha[background_mask > 0])
+        alpha_refined[background_mask > 0] = np.where(alpha[background_mask > 0] < 50, 0, alpha_refined[background_mask > 0])
         
-        # Apply refined alpha
+        # Smooth transition
+        alpha_refined = cv2.GaussianBlur(alpha_refined, (3,3), 0)
+        alpha_refined = np.where(alpha_refined > 10, alpha_refined, 0)  # Remove faint residuals
+        
         img_array[:,:,3] = alpha_refined
         
         return img_array
