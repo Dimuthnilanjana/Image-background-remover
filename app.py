@@ -65,7 +65,7 @@ def remove_background():
         # Save output
         output_filename = f"processed_{uuid.uuid4()}_{int(time.time())}.png"
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
-        result.save(output_path)
+        result.save(output_path, format='PNG', optimize=True)  # Ensure PNG format with optimization
         
         logger.info(f"Processing time: {time.time() - start_time:.2f} seconds")
         
@@ -85,9 +85,6 @@ def remove_background_enhanced(img_data, alpha_matting=True,
                              subject_type='general'):
     """
     Enhanced background removal with multiple techniques
-    
-    Parameters:
-    - subject_type: 'human' or 'general' to select appropriate model
     """
     try:
         # Select appropriate session
@@ -108,7 +105,7 @@ def remove_background_enhanced(img_data, alpha_matting=True,
         
         # Convert to numpy array
         img = Image.open(io.BytesIO(output)).convert('RGBA')
-        img_array = np.array(img)
+        img_array = np.array(img, dtype=np.uint8)  # Ensure uint8 type
         
         if img_array.shape[2] != 4:
             logger.warning("Image has no alpha channel")
@@ -126,6 +123,11 @@ def remove_background_enhanced(img_data, alpha_matting=True,
             subject_type=subject_type
         )
         
+        # Normalize alpha channel to ensure full opacity where needed
+        alpha_refined = np.where(alpha_refined > 128, 255, 0).astype(np.uint8)  # Binary threshold
+        # Preserve semi-transparency if original alpha was semi-transparent
+        alpha_refined = np.where(alpha > 0, alpha_refined, 0)
+        
         # Apply refined alpha
         img_array[:,:,3] = alpha_refined
         
@@ -133,11 +135,15 @@ def remove_background_enhanced(img_data, alpha_matting=True,
         if subject_type == 'human':
             img_array = cleanup_human_edges(img_array)
         
+        # Ensure RGB channels are fully opaque where alpha is present
+        mask = img_array[:,:,3] > 0
+        img_array[mask, :3] = np.clip(img_array[mask, :3], 0, 255)
+        
         return Image.fromarray(img_array)
     
     except Exception as e:
         logger.error(f"Error in remove_background_enhanced: {str(e)}")
-        return Image.open(io.BytesIO(img_data))  # Return original on failure
+        return Image.open(io.BytesIO(img_data))
 
 def refine_alpha_channel(alpha, detail_level='high', subject_type='general'):
     """Advanced alpha channel refinement"""
@@ -146,24 +152,24 @@ def refine_alpha_channel(alpha, detail_level='high', subject_type='general'):
         edges = cv2.Canny(alpha, 100, 200)
         
         if detail_level == 'low':
-            return cv2.GaussianBlur(alpha, (5, 5), 0)
+            refined = cv2.GaussianBlur(alpha, (5, 5), 0)
         
         elif detail_level == 'medium':
-            # Adaptive thresholding for better edge preservation
             alpha_adaptive = cv2.adaptiveThreshold(
                 alpha, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY, 11, 2
             )
-            return cv2.medianBlur(alpha_adaptive, 3)
+            refined = cv2.medianBlur(alpha_adaptive, 3)
         
         else:  # high detail
-            # Multi-stage refinement
             alpha_smooth = cv2.bilateralFilter(alpha, 9, 75, 75)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
             alpha_eroded = cv2.erode(alpha_smooth, kernel, iterations=1)
             alpha_dilated = cv2.dilate(alpha_eroded, kernel, iterations=1)
-            alpha_final = cv2.addWeighted(alpha_dilated, 0.7, edges, 0.3, 0)
-            return np.clip(alpha_final, 0, 255)
+            refined = cv2.addWeighted(alpha_dilated, 0.7, edges, 0.3, 0)
+        
+        # Ensure proper range
+        return np.clip(refined, 0, 255).astype(np.uint8)
     
     except Exception as e:
         logger.error(f"Error in refine_alpha_channel: {str(e)}")
@@ -179,10 +185,10 @@ def cleanup_human_edges(img_array):
         lower_skin = np.array([0, 20, 70], dtype=np.uint8)
         upper_skin = np.array([20, 255, 255], dtype=np.uint8)
         
-        # Create mask for skin areas (2D)
+        # Create mask for skin areas
         skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
         
-        # Get alpha channel (2D)
+        # Get alpha channel
         alpha = img_array[:,:,3]
         alpha_refined = alpha.copy()
         
@@ -193,6 +199,9 @@ def cleanup_human_edges(img_array):
         
         # Apply the dilated result only where skin_mask is True
         alpha_refined[skin_mask > 0] = dilated_skin[skin_mask > 0]
+        
+        # Ensure full opacity in skin areas
+        alpha_refined[skin_mask > 0] = 255
         
         # Update the original array
         img_array[:,:,3] = alpha_refined
