@@ -97,7 +97,7 @@ def process_image(img_data, params):
         alpha = np.where(alpha > 20, 255, 0).astype(np.uint8)
         img_array[:,:,3] = alpha
         
-        # Make fully transparent pixels completely black (0,0,0,0)
+        # Make fully transparent pixels completely black (0,0,0,0) hhhhhhhh
         mask = alpha == 0
         img_array[mask, 0:3] = 0
         
